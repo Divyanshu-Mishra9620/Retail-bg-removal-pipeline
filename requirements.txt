@@ -1,0 +1,28 @@
+# ── Core deep-learning stack ──────────────────────────────────────────────────
+# PyTorch: install the CUDA variant that matches your driver FIRST.
+# GPU (CUDA 12.1, recommended):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CPU-only fallback:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+torch>=2.5.0
+torchvision>=0.20.0
+
+# ── HuggingFace ecosystem (BiRefNet) ─────────────────────────────────────────
+transformers>=4.40.0
+huggingface-hub>=0.20.0
+safetensors>=0.4.0
+accelerate>=0.30.0
+timm>=1.0.0
+
+# ── YOLO-seg ──────────────────────────────────────────────────────────────────
+ultralytics>=8.0.0
+
+# ── Image processing ──────────────────────────────────────────────────────────
+# opencv-contrib-python includes ximgproc (guided filter)
+# Do NOT install opencv-python alongside it — they conflict.
+opencv-contrib-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+tqdm>=4.60.0

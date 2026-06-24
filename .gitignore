@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Model weights (large binary — store separately)
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+
+# Pipeline outputs (generated files)
+input_images/
+output_clean/
+output_review/
+review/
+review_birefnet/
+rem_bg_output/
+results_bi_yolo/
+input_img/
+curation_backup/
+
+# Manifests & logs (generated at runtime)
+*.jsonl
+*.log
+
+# Data files
+*.csv
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Misc test / scratch scripts (not part of the pipeline)
+test.py
+test2.py
+test3.py
+test_refi.py
+packshot_bg_remove.py
+rem_bg_test.py
+rem_bg_yolo_integrated.py
+remove_bg.py
+pro.py
+program.py
+rem_bg_final.py
+faultttttt.py
+debug_masks.py
+fix_gdino.py
+simple_bg_remove.py
+download_csv_images.py
+download_images.py
+download_leftover_images.py
+fetch_originals.py
+find_leftovers.py
+get_leftovers.py
+match_and_sort.py
+move_reviews.py
+copy_review_matches.py
+image.csv
+3ad85d3d*.csv
+Retail_AI_Training/
