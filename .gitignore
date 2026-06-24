@@ -15,9 +15,10 @@ venv/
 env/
 
 # Model weights (large binary — store separately)
-*.pt
+# best.pt is committed directly (6.5 MB, within GitHub's limit)
 *.pth
 *.onnx
+# *.bin and *.safetensors are HuggingFace cache files, not committed
 *.bin
 *.safetensors
 
