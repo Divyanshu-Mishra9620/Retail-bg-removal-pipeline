@@ -1,190 +1,87 @@
 # Retail Product Background Removal Pipeline
 
-A production-grade background removal pipeline for retail product images. It fuses two complementary models — **YOLOv8-seg** (semantic mask) and **BiRefNet** (detail-preserving alpha matting) — to produce clean, transparent-background PNG cutouts at scale.
+A production orchestrator that turns two proven background-removal scripts into one automated, resumable, batch pipeline for retail product images — **without changing their image-processing behavior**.
+
+The pipeline does **not** reimplement any segmentation, refinement, QA, or compositing logic. It imports the original functions verbatim and only adds production concerns: load-once models, per-image routing, resumable batching, a JSON manifest, and leak-proof PNG output. The result for any given image is identical to running the original script that produced it.
 
 ---
 
 ## Table of Contents
 
-1. [How It Works](#how-it-works)
-2. [Architecture Deep-Dive](#architecture-deep-dive)
-3. [Project Structure](#project-structure)
-4. [Installation](#installation)
-5. [Models Setup](#models-setup)
-6. [Usage](#usage)
-7. [CLI Reference](#cli-reference)
-8. [Output & Manifest](#output--manifest)
-9. [Module Reference](#module-reference)
-10. [Design Decisions](#design-decisions)
+1. [Source of Truth](#source-of-truth)
+2. [How It Works](#how-it-works)
+3. [Why Two Scripts](#why-two-scripts)
+4. [Project Structure](#project-structure)
+5. [Installation](#installation)
+6. [Models Setup](#models-setup)
+7. [Usage](#usage)
+8. [CLI Reference](#cli-reference)
+9. [Output & Manifest](#output--manifest)
+10. [Module Reference](#module-reference)
+11. [Design Decisions](#design-decisions)
+
+---
+
+## Source of Truth
+
+The two original scripts are the canonical implementations. The pipeline imports their functions and calls them unchanged:
+
+| Original script | Role in pipeline | Functions reused (verbatim) |
+|---|---|---|
+| `test_BiRefNet.py` | **Primary** — BiRefNet matting flow | `predict_alpha`, `refine_alpha` (guided filter → GrabCut → component cleanup → hole fill → solidify → trim/feather), `assess_mask`, `MaskQuality`, `build_transform`, `load_model`, `yolo_detect` |
+| `Retail_AI_Training/test.py` | **Fallback** — YOLO-seg flow | `mask_from_result`, `smooth_alpha`, `read_bgr` |
+
+`universal_pipeline/originals.py` loads both scripts as modules and re-exports these symbols. Every threshold, kernel size, blur radius, GrabCut iteration count, ImageNet normalization, and resize dimension is therefore exactly the original value — there is no second copy to drift.
 
 ---
 
 ## How It Works
 
-The pipeline runs every input image through a **4-stage process**:
+Each image is routed through one original script's exact flow. "Script A → Script B if needed":
 
 ```
 Input Image
     │
     ▼
-┌─────────────────────────────────────────────────────────┐
-│  Stage 1 — YOLO-seg (best.pt)                           │
-│  Single inference → semantic union mask + padded bbox   │
-└──────────────────────┬──────────────────────────────────┘
-                       │ box + mask
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│  Stage 2 — BiRefNet (ZhengPeng7/BiRefNet_dynamic)       │
-│  Runs on the YOLO crop (not full image) for speed       │
-│  Outputs a high-res alpha matte at 1024×1024            │
-└──────────────────────┬──────────────────────────────────┘
-                       │ refined alpha (back-projected)
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│  Stage 3 — Alpha Refinement Chain                       │
-│  Guided filter → GrabCut → component cleanup →          │
-│  hole fill → solidify → trim & feather                  │
-└──────────────────────┬──────────────────────────────────┘
-                       │ cleaned alpha
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│  Stage 4 — Semantic-Gated Matting (Fusion)              │
-│  GATE: zero BiRefNet alpha outside dilated YOLO mask    │
-│  FILL: restore product pixels BiRefNet dropped          │
-└──────────────────────┬──────────────────────────────────┘
-                       │ fused alpha
-                       ▼
-┌─────────────────────────────────────────────────────────┐
-│  Stage 5 — QA Gate + Fallback Cascade                   │
-│  assess_mask() → route to output/ or review/            │
-│  If QA fails: pick best of {fused, BiRefNet, YOLO-only} │
-└──────────────────────┬──────────────────────────────────┘
-                       │
-                       ▼
-             output_clean/  or  output_review/
+┌──────────────────────────────────────────────────────────────┐
+│  PRIMARY — test_BiRefNet.py flow (exact reproduction)         │
+│  EXIF-correct load → YOLO detection box (+pad) → crop →       │
+│  BiRefNet @1024² → refine_alpha → back-project → assess_mask  │
+└───────────────────────────┬──────────────────────────────────┘
+                            │
+                ┌───────────┴────────────┐
+          QA = success               QA = review
+                │                         │
+                ▼                         ▼
+          output_clean/      ┌──────────────────────────────────┐
+                             │  FALLBACK — test.py flow (exact)  │
+                             │  cv2 read → YOLO-seg → mask_from_  │
+                             │  result → smooth_alpha            │
+                             └───────────────┬───────────────────┘
+                                             │
+                              ┌──────────────┴───────────────┐
+                         mask found                     no mask
+                              │                              │
+                              ▼                              ▼
+                        output_clean/                 output_review/
+                     (exactly test.py's          (BiRefNet review result
+                       output)                     kept for inspection)
 ```
 
-**No image is ever rejected** — every stage has a fallback so even partial detections produce some output.
+- **No fusion, no blending.** Each saved cutout is exactly what one original script would produce.
+- **No hard failures.** If BiRefNet errors, the YOLO-seg flow is tried; if both are insufficient, the image is routed to review rather than dropped.
+- **Resumable.** Images that already have an output are skipped (use `--overwrite` to redo).
 
 ---
 
-## Architecture Deep-Dive
+## Why Two Scripts
 
-### Why Two Models?
-
-| Model | Strength | Weakness |
+| Script / model | Strength | Weakness |
 |---|---|---|
-| **YOLOv8-seg** (`best.pt`) | Knows *what* is a product (trained on retail data); fast; gives a semantic bounding box | Coarse 160×160 prototype masks upsampled to full resolution — edges are blocky |
-| **BiRefNet** | Sub-pixel edge quality (1024² matting); handles hair, glass, fur | Generic saliency — can chase glare, shelf edges, or drop low-contrast product (brown meat, white-on-white) |
+| `test_BiRefNet.py` — **BiRefNet** matting | Sub-pixel edge quality (1024² matte, guided filter, feather); handles fine/soft edges | Generic saliency — can struggle on cluttered or same-color scenes |
+| `test.py` — **YOLOv8-seg** (`best.pt`, 1 class: `product`) | Trained on retail products — knows *what* a product is; robust where saliency fails | Coarse 160² prototype masks upsampled → blocky edges |
 
-Fusion takes **BiRefNet's edge quality** and **YOLO's semantic correctness**.
-
----
-
-### Stage 1 — YOLO-seg Inference
-
-`models.yolo_segment()` runs a **single** `model.predict()` call and extracts:
-
-- **Semantic union mask** — union of all instance masks above `--min-mask-area` pixels (used as fusion prior)
-- **Padded crop box** — tight bounding box of the union mask, expanded by `--yolo-pad` fraction (used as BiRefNet input hint)
-
-A single inference gives both, with zero redundant computation.
-
-Fallback: if YOLO weights are missing or ultralytics is not installed, the pipeline continues in **BiRefNet-only mode** (full-image inference).
-
----
-
-### Stage 2 — BiRefNet Inference
-
-`inference.predict_alpha()` runs BiRefNet on the YOLO crop (or full image if no detection):
-
-1. Resize crop to `--size × --size` (default 1024)
-2. Normalise with ImageNet mean/std
-3. Forward pass (FP16 on CUDA for speed)
-4. Sigmoid → resize back to crop dimensions → uint8 alpha
-
-The refined crop alpha is then **back-projected** onto a full-image zero canvas.
-
-BiRefNet handles heterogeneous output formats (tensor, dict, list/tuple) via `extract_prediction()` — it works with any variant of the BiRefNet family on HuggingFace.
-
----
-
-### Stage 3 — Alpha Refinement Chain
-
-`postprocessing.refine_alpha()` runs six operations in order:
-
-| Step | Function | What it does |
-|---|---|---|
-| 1 | `guided_filter_alpha` | Edge-aware smoothing — aligns soft alpha edges to the RGB gradient (requires `opencv-contrib`) |
-| 2 | `grabcut_refine_alpha` | Runs OpenCV GrabCut seeded from the BiRefNet alpha, then suppresses border-connected skin regions (hand suppression) |
-| 3 | `remove_small_components` | Drops noise blobs below `0.1%` of image area; or keeps only the largest blob (`--component-mode largest`) |
-| 4 | `fill_internal_holes` | Fills holes inside the product silhouette using contour fill |
-| 5 | `solidify_alpha` | Morphological close + contour fill — removes partial transparency in the product core |
-| 6 | `trim_and_feather` | 1-pixel border erosion + Gaussian blur — softens hard edges for compositing |
-
-Each step can be individually disabled via CLI flags (e.g. `--no-guided-filter`, `--no-grabcut-refine`).
-
----
-
-### Stage 4 — Semantic-Gated Matting (Fusion)
-
-`fusion.fuse_alpha()` combines the refined BiRefNet alpha with the raw YOLO mask:
-
-```
-GATE operation
-──────────────
-1. Dilate YOLO mask by --gate-dilate-frac (fraction of image's shorter side)
-2. Zero any BiRefNet alpha that falls OUTSIDE the dilated region
-→ Kills BiRefNet false positives (shelf edges, reflections, background items)
-   The dilation gives BiRefNet's finer edge room so the coarse YOLO boundary
-   never clips real product pixels.
-
-FILL operation
-──────────────
-1. Erode YOLO mask by --fill-erode-frac to find a confident product interior
-2. Where the interior says "product" BUT fused alpha < --fill-min-alpha, set alpha = 255
-→ Rescues low-contrast product that BiRefNet dropped
-   (e.g. dark brown product on dark background, white product on white background)
-
-Final: light feather (--fusion-feather) smooths the seam between filled and gated regions
-```
-
-Disable fusion entirely with `--no-fusion` (useful for debugging individual models).
-
----
-
-### Stage 5 — QA Gate & Fallback Cascade
-
-`quality.assess_mask()` checks four conditions:
-
-| Check | Threshold | Reason flagged |
-|---|---|---|
-| `foreground_ratio < 0.015` | Almost everything is transparent | Model removed too much |
-| `foreground_ratio > 0.995` | Almost nothing was removed | Background removal failed completely |
-| `touches_border_ratio > 0.92` | Product fills most of the image border | Possible full-background image |
-| `components > 25 AND largest < 15%` | Mask is fragmented | Noise, not a product |
-
-If QA fails, the pipeline scores all available candidates (fused alpha, BiRefNet-only, YOLO-mask-only) using `quality_score()` and picks the highest-scoring one instead of discarding the image.
-
-`quality_score()` = `10 × (status == "success") + fg_score + border_score + largest_component_ratio`
-
-where `fg_score` is highest near `foreground_ratio ≈ 0.35` (typical product fill on a clean background).
-
----
-
-### Routing Modes
-
-Each image's result records one of these routing labels in the manifest:
-
-| Routing | Meaning |
-|---|---|
-| `fused` | YOLO + BiRefNet fusion (best quality path) |
-| `birefnet_crop` | BiRefNet on YOLO crop, no fusion (YOLO found box but no mask) |
-| `fullimg_fallback` | No YOLO detection — BiRefNet on full image |
-| `yolo_mask_only` | BiRefNet crashed — raw YOLO mask used |
-| `birefnet_alt` | QA fallback: un-gated BiRefNet (fusion over-clipped) |
-| `yolo_mask_alt` | QA fallback: YOLO mask scored better than fused result |
-| `none` | Complete failure (both models failed) |
+BiRefNet runs first for its edge quality. When its QA gate flags a result as suspect, the semantically-trained YOLO-seg flow takes over.
 
 ---
 
@@ -192,27 +89,29 @@ Each image's result records one of these routing labels in the manifest:
 
 ```
 bg_remove/
-├── run_pipeline.py          # Entry point — CLI, model loading, batch loop
-├── best.pt                  # YOLOv8-seg weights (1-class: product)
+├── run_pipeline.py            # Entry point — CLI, load-once models, batch loop, manifest
+├── test_BiRefNet.py           # ORIGINAL script — BiRefNet flow (source of truth)
+├── Retail_AI_Training/
+│   └── test.py                # ORIGINAL script — YOLO-seg flow (source of truth)
+├── best.pt                    # YOLOv8-seg weights (1 class: product)
 ├── requirements.txt
 ├── README.md
 │
 └── universal_pipeline/
     ├── __init__.py
-    ├── config.py            # SystemConfig dataclass (all hyperparameters)
-    ├── models.py            # load_yolo, load_birefnet, yolo_segment
-    ├── inference.py         # predict_alpha (BiRefNet forward pass)
-    ├── postprocessing.py    # refine_alpha chain (guided filter, grabcut, etc.)
-    ├── fusion.py            # fuse_alpha (semantic-gated matting)
-    ├── quality.py           # assess_mask, quality_score, save_cutout
-    └── image_io.py          # iter_images, read_bgr (Unicode-safe)
+    ├── originals.py           # Loads both originals; re-exports their functions verbatim
+    ├── config.py              # SystemConfig — all params at original defaults
+    ├── models.py              # load_yolo (cached) + re-exported build_transform/load_birefnet
+    ├── quality.py             # assess_mask/MaskQuality (from original) + leak-proof save_cutout
+    ├── image_io.py            # iter_images, read_bgr, save_original_to_review (Unicode-safe)
+    └── orchestrator.py        # Per-image routing: BiRefNet flow → YOLO-seg fallback
 ```
 
-**Runtime directories** (created automatically, not committed to git):
+**Runtime directories** (auto-created, git-ignored):
 ```
-input_images/          # Drop your product images here
-output_clean/          # Accepted cutouts (RGBA PNG, transparent background)
-output_review/         # QA-flagged images that need human review
+input_images/            # Drop your product images here
+output_clean/            # Accepted cutouts (RGBA PNG, transparent background)
+output_review/           # QA-flagged images for human review
 pipeline_manifest.jsonl  # Per-image log: status, routing, quality metrics
 ```
 
@@ -221,194 +120,140 @@ pipeline_manifest.jsonl  # Per-image log: status, routing, quality metrics
 ## Installation
 
 ### Prerequisites
-
-- Python 3.10 or newer
-- A CUDA-capable GPU is strongly recommended (NVIDIA, with driver ≥ 525)
-- CPU mode works but is ~15-50× slower
+- Python 3.10+
+- A CUDA-capable NVIDIA GPU is strongly recommended (CPU works but is ~15–50× slower)
 
 ### Steps
-
 ```bash
-# 1. Clone the repository
 git clone <repo-url>
 cd bg_remove
 
-# 2. Create and activate a virtual environment
 python -m venv venv
-
 # Windows
 venv\Scripts\activate
-
 # macOS / Linux
 source venv/bin/activate
 
-# 3. Install PyTorch with CUDA support (adjust cu121 to your driver version)
+# PyTorch with CUDA (match cu121 to your driver; use /whl/cpu for CPU-only)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# CPU-only machines:
-# pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-
-# 4. Install remaining dependencies
 pip install -r requirements.txt
 ```
 
-> **Important:** `opencv-contrib-python` includes the `ximgproc` module needed for the guided filter step. Do **not** install `opencv-python` alongside it — they conflict.
+> **Important:** the pipeline must run in this environment. `ultralytics` (YOLO) lives here; the system Python likely does not have it, and without it the YOLO-seg fallback is disabled. Always invoke the venv interpreter explicitly (see Usage).
+
+> `opencv-contrib-python` provides the `ximgproc` guided filter used by `refine_alpha`. Do not install `opencv-python` alongside it — they conflict.
 
 ---
 
 ## Models Setup
 
 ### YOLO-seg (`best.pt`)
-
-`best.pt` is a custom-trained YOLOv8-seg model (1 class: `product`). Place it in the project root (or point to it with `--yolo-model`).
-
-If `best.pt` is missing, the pipeline automatically falls back to **BiRefNet-only mode** with a warning — no crash.
+Custom-trained YOLOv8-seg model, 1 class `product`. Keep it in the project root (or pass `--yolo-model`). If it is missing or `ultralytics` is unavailable, BiRefNet runs on full images and the YOLO-seg fallback is skipped — with a warning, no crash.
 
 ### BiRefNet
-
-BiRefNet is downloaded automatically from HuggingFace on first run:
-
-```bash
-# Add --allow-model-download on the very first run
-python run_pipeline.py --input ./input_images --allow-model-download
-```
-
-On subsequent runs, omit the flag — the model is loaded from the local HuggingFace cache (`~/.cache/huggingface/`).
-
-The default model is `ZhengPeng7/BiRefNet_dynamic` (dynamic resolution variant). Change it with `--model`.
+Downloaded from HuggingFace on first run (`ZhengPeng7/BiRefNet_dynamic`). Add `--allow-model-download` the first time; afterwards it loads from the local cache.
 
 ---
 
 ## Usage
 
-### Basic run
+Run with the **venv interpreter** (so YOLO is available):
 
+```powershell
+# Windows
+.\venv\Scripts\python.exe run_pipeline.py --input ./input_images --output ./output_clean --review ./output_review
+```
 ```bash
-python run_pipeline.py --input ./input_images --output ./output_clean
+# macOS / Linux
+./venv/bin/python run_pipeline.py --input ./input_images --output ./output_clean --review ./output_review
 ```
 
-### First run (download BiRefNet)
-
-```bash
-python run_pipeline.py --input ./input_images --allow-model-download
+First run (download BiRefNet weights):
+```powershell
+.\venv\Scripts\python.exe run_pipeline.py --input ./input_images --allow-model-download
 ```
 
-### Dry run (analyse without writing files)
-
-```bash
-python run_pipeline.py --input ./input_images --dry-run
+Dry run (analyse, write nothing):
+```powershell
+.\venv\Scripts\python.exe run_pipeline.py --input ./input_images --dry-run
 ```
 
-### CPU-only machine
-
-```bash
-python run_pipeline.py --input ./input_images --device cpu --no-fp16
+CPU-only:
+```powershell
+.\venv\Scripts\python.exe run_pipeline.py --input ./input_images --device cpu --no-fp16
 ```
 
-### Disable fusion (BiRefNet-only output)
-
-```bash
-python run_pipeline.py --input ./input_images --no-fusion
-```
-
-### Keep only the largest detected component
-
-```bash
-python run_pipeline.py --input ./input_images --component-mode largest
-```
-
-### Reprocess already-completed images
-
-```bash
-python run_pipeline.py --input ./input_images --overwrite
-```
+The run is resumable — stop with Ctrl-C and rerun; completed images are skipped. Use `--overwrite` to reprocess.
 
 ---
 
 ## CLI Reference
 
 ### I/O
-
 | Flag | Default | Description |
 |---|---|---|
-| `--input` | `./input_images` | Folder containing product images |
-| `--output` | `./output_clean` | Destination for accepted cutouts |
-| `--review` | `./output_review` | Destination for QA-flagged cutouts |
+| `--input` | `./input_images` | Folder of input images |
+| `--output` | `./output_clean` | Accepted cutouts |
+| `--review` | `./output_review` | QA-flagged cutouts |
 | `--manifest` | `./pipeline_manifest.jsonl` | Per-image JSON log |
 
-### YOLO-seg
-
+### Shared model
 | Flag | Default | Description |
 |---|---|---|
-| `--yolo-model` | `./best.pt` | Path to YOLOv8-seg weights |
-| `--yolo-conf` | `0.25` | Confidence threshold |
-| `--yolo-iou` | `0.7` | NMS IoU threshold |
-| `--yolo-imgsz` | `640` | Inference image size |
-| `--min-mask-area` | `500` | Minimum pixels for a YOLO instance mask to count |
-| `--yolo-pad` | `0.15` | Fractional padding around the crop box (0.15 = 15%) |
+| `--yolo-model` | `./best.pt` | YOLOv8-seg weights (used by both flows) |
 
-### BiRefNet
-
+### BiRefNet flow (primary) — `test_BiRefNet.py` defaults
 | Flag | Default | Description |
 |---|---|---|
 | `--model` | `ZhengPeng7/BiRefNet_dynamic` | HuggingFace model ID |
 | `--size` | `1024` | BiRefNet inference square size |
-| `--device` | auto (cuda/cpu) | Inference device |
-| `--no-fp16` | — | Disable FP16 on CUDA (use FP32) |
+| `--device` | auto | `cuda` or `cpu` |
+| `--no-fp16` | — | Disable FP16 on CUDA |
 | `--allow-model-download` | — | Allow HuggingFace download on first run |
-
-### Fusion (Semantic-Gated Matting)
-
-| Flag | Default | Description |
-|---|---|---|
-| `--fusion` / `--no-fusion` | enabled | Enable/disable semantic-gated matting |
-| `--gate-dilate-frac` | `0.02` | YOLO mask dilation before gating (fraction of image shorter side) |
-| `--fill-erode-frac` | `0.06` | YOLO mask erosion to find confident interior |
-| `--fill-min-alpha` | `40` | BiRefNet alpha threshold below which a YOLO-confident pixel is filled |
-| `--fusion-feather` | `0.8` | Gaussian sigma to smooth fill/gate seams |
-
-### Alpha Refinement
-
-| Flag | Default | Description |
-|---|---|---|
+| `--yolo-conf` | `0.15` | YOLO confidence for the crop box |
+| `--yolo-pad` | `0.15` | Fractional padding around the crop box |
 | `--guided-filter` / `--no-guided-filter` | enabled | Edge-aware alpha smoothing |
-| `--grabcut-refine` / `--no-grabcut-refine` | enabled | GrabCut boundary locking |
-| `--grabcut-iters` | `5` | GrabCut EM iterations |
+| `--grabcut-refine` / `--no-grabcut-refine` | enabled | GrabCut boundary locking + hand suppression |
+| `--grabcut-iters` | `5` | GrabCut iterations |
 | `--hand-suppression` / `--no-hand-suppression` | enabled | Suppress border-connected skin regions |
-| `--component-mode` | `all` | `all` = keep all blobs above threshold; `largest` = keep only the biggest |
+| `--component-mode` | `all` | `all` or `largest` |
 | `--solidify` / `--no-solidify` | enabled | Morphological close + contour fill |
-| `--edge-trim` | `1` | Pixels to erode from the hard mask boundary |
-| `--feather` | `0.8` | Gaussian sigma for final edge softening |
-| `--edge-blur` | `5` | Smoothing kernel for YOLO-mask fallback path |
+| `--edge-trim` | `1` | Border erosion (pixels) |
+| `--feather` | `0.8` | Final edge Gaussian sigma |
+
+### YOLO-seg flow (fallback) — `test.py` defaults
+| Flag | Default | Description |
+|---|---|---|
+| `--seg-conf` | `0.25` | YOLO-seg confidence |
+| `--seg-iou` | `0.7` | YOLO-seg NMS IoU |
+| `--seg-imgsz` | `640` | YOLO-seg inference size |
+| `--min-mask-area` | `500` | Min pixels for a YOLO-seg mask to count |
+| `--edge-blur` | `5` | `smooth_alpha` blur radius |
 
 ### Misc
-
 | Flag | Default | Description |
 |---|---|---|
-| `--save-masks` | — | Also save grayscale alpha masks alongside cutouts |
-| `--overwrite` | — | Re-process images that already have output |
-| `--dry-run` | — | Run pipeline analysis without writing any files |
+| `--save-masks` | — | Also save grayscale alpha masks |
+| `--overwrite` | — | Reprocess images that already have output |
+| `--dry-run` | — | Analyse without writing files |
 
 ---
 
 ## Output & Manifest
 
-### Output files
+**Output files**
+- `output_clean/<name>.png` — RGBA PNG, transparent background. Transparent pixels are written as black on a fresh canvas (leak-proof), so `convert("RGB")` cannot recover the original background.
+- `output_review/<name>.png` — same format; QA flagged for human inspection.
+- `output_clean/<name>_mask.png` — grayscale alpha (with `--save-masks`).
 
-- **`output_clean/<name>.png`** — RGBA PNG with transparent background. RGB data in transparent pixels is replaced with black (not just hidden), so `convert("RGB")` cannot reveal the original background.
-- **`output_review/<name>.png`** — Same format, but QA flagged these for human inspection.
-- **`output_clean/<name>_mask.png`** (with `--save-masks`) — Grayscale alpha map.
-
-### Manifest (`pipeline_manifest.jsonl`)
-
-Each line is a JSON record for one image:
-
+**Manifest** (`pipeline_manifest.jsonl`) — one JSON record per image:
 ```json
 {
   "input": "input_images/product_001.jpg",
   "status": "success",
-  "reason": "ok",
-  "routing": "fused",
+  "reason": null,
+  "routing": "birefnet_yolo_crop",
   "quality": {
     "transparent_ratio": 0.6823,
     "foreground_ratio": 0.3177,
@@ -422,9 +267,17 @@ Each line is a JSON record for one image:
 }
 ```
 
-`status` is one of: `success`, `review`, `error`.
+`status` ∈ `success` | `review` | `error`.
 
-`routing` is one of: `fused`, `birefnet_crop`, `fullimg_fallback`, `yolo_mask_only`, `birefnet_alt`, `yolo_mask_alt`, `none`.
+`routing` values:
+
+| Routing | Meaning |
+|---|---|
+| `birefnet_yolo_crop` | BiRefNet on the YOLO crop (primary path) |
+| `birefnet_fullimage` | No YOLO detection — BiRefNet on the full image |
+| `yolo_seg_fallback` | BiRefNet QA failed → test.py YOLO-seg output used |
+| `birefnet_yolo_crop_review` / `birefnet_fullimage_review` | BiRefNet result kept and routed to review (fallback also insufficient) |
+| `none` | BiRefNet errored and no YOLO-seg mask available → original copied to review |
 
 ---
 
@@ -432,25 +285,26 @@ Each line is a JSON record for one image:
 
 | Module | Key exports | Responsibility |
 |---|---|---|
-| `config.py` | `SystemConfig` | Single dataclass holding every hyperparameter; constructed from CLI args |
-| `models.py` | `load_yolo`, `load_birefnet`, `build_transform`, `yolo_segment` | One-time model loading + YOLO inference |
-| `inference.py` | `predict_alpha` | BiRefNet forward pass → uint8 alpha at input resolution |
-| `postprocessing.py` | `refine_alpha`, `smooth_alpha` | Full 6-step alpha refinement; `smooth_alpha` for YOLO-only fallback |
-| `fusion.py` | `fuse_alpha` | Semantic-gated matting (GATE + FILL) |
-| `quality.py` | `assess_mask`, `quality_score`, `save_cutout` | QA metrics, scorer for fallback selection, leak-proof PNG writer |
-| `image_io.py` | `iter_images`, `read_bgr` | Unicode-safe image discovery and decode (handles non-ASCII filenames on Windows) |
-| `orchestrator.py` | `process_one_image` | Wires all stages together; handles all fallback paths; returns manifest record |
+| `originals.py` | re-exports of all original functions | Loads `test_BiRefNet.py` + `Retail_AI_Training/test.py` as modules; single source of truth |
+| `config.py` | `SystemConfig` | All parameters at original defaults; attribute names match what `test_BiRefNet.py`'s `refine_alpha` reads off `args` |
+| `models.py` | `load_yolo`, `build_transform`, `load_birefnet` | Load each model once; build_transform/load_birefnet re-exported from the original |
+| `quality.py` | `assess_mask`, `MaskQuality`, `save_cutout`, `verify_hidden_background_removed` | Original QA gate + leak-proof PNG writer + leak auditor |
+| `image_io.py` | `iter_images`, `read_bgr`, `save_original_to_review` | Unicode-safe discovery/decode (handles non-ASCII filenames on Windows) |
+| `orchestrator.py` | `process_one_image` | Per-image routing only — reproduces each original flow, no image processing of its own |
+| `run_pipeline.py` | `main` | CLI, load-once models, batch loop, skip/resume, manifest, summary |
 
 ---
 
 ## Design Decisions
 
-**Single YOLO inference per image.** Both the semantic mask (fusion prior) and the crop box (BiRefNet hint) come from the same `model.predict()` call — there is no second forward pass.
+**Orchestrate, don't reimplement.** All image processing comes from the original scripts via `originals.py`. The merged code only decides which flow to run and handles batching/IO. This guarantees output parity with the originals and removes any risk of a rewritten filter silently changing quality.
 
-**Crop then BiRefNet, not full-image BiRefNet.** Running BiRefNet on the YOLO crop (typically 30–60% of the image) reduces compute significantly and also helps BiRefNet focus on the product rather than the full scene.
+**BiRefNet primary, YOLO-seg fallback.** BiRefNet gives the best edges; its own QA gate (`assess_mask`) decides when a result is suspect, at which point the semantically-trained YOLO-seg flow produces the cutout instead.
 
-**Graceful degradation instead of hard failures.** The pipeline never raises an uncaught exception to abort a batch. Missing YOLO weights → BiRefNet-only. BiRefNet crash → YOLO-mask-only. QA fail → best-scored fallback. This makes large batch runs reliable without manual supervision.
+**Models loaded once.** YOLO and BiRefNet are loaded a single time and reused for the whole batch. (YOLO is invoked per flow at its source script's own confidence — 0.15 for the BiRefNet crop box, 0.25 for the YOLO-seg fallback — matching each original exactly.)
 
-**Leak-proof PNG output.** `save_cutout()` builds the output on a fresh black canvas and copies original RGB only to foreground pixels. This physically destroys background pixel data — `convert("RGB")` on the output cannot reveal the original scene.
+**Graceful degradation.** Missing YOLO weights or `ultralytics` → BiRefNet full-image mode. BiRefNet crash → YOLO-seg flow. Both insufficient → review folder. A batch never aborts on one bad image.
 
-**Unicode-safe I/O.** `read_bgr()` uses `np.fromfile + cv2.imdecode` instead of `cv2.imread` to handle non-ASCII filenames (Spanish product names, Chinese category labels, etc.) correctly on Windows.
+**Leak-proof PNG output.** `save_cutout()` composites onto a fresh black canvas and copies original RGB only to foreground pixels, physically destroying background data (matching `test.py`'s approach). `verify_hidden_background_removed()` can audit any output for residual background.
+
+**Unicode-safe I/O.** `read_bgr()` uses `np.fromfile + cv2.imdecode` so non-ASCII filenames (e.g. Spanish category names) decode correctly on Windows.

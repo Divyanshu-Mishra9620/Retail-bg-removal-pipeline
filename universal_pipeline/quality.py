@@ -1,79 +1,18 @@
 """
-QA gate — assess mask quality and route images to success or review folder.
-Ported from test_BiRefNet.py.
+QA gate + leak-proof saving.
+
+assess_mask / MaskQuality are imported VERBATIM from the original
+test_BiRefNet.py (via originals) — no reimplementation. save_cutout is the
+leak-proof compositor (matches test.py's black-canvas approach).
 """
 
-from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
 import numpy as np
 from PIL import Image
 
-
-@dataclass
-class MaskQuality:
-    transparent_ratio: float
-    foreground_ratio: float
-    touches_border_ratio: float
-    components: int
-    largest_component_ratio: float
-    status: str   # "success" | "review"
-    reason: str
-
-
-def assess_mask(alpha: np.ndarray) -> MaskQuality:
-    hard = alpha >= 128
-    h, w = hard.shape
-    area = h * w
-
-    foreground_ratio = float(hard.mean())
-    transparent_ratio = 1.0 - foreground_ratio
-
-    border = np.concatenate([hard[0, :], hard[-1, :], hard[:, 0], hard[:, -1]])
-    touches_border_ratio = float(border.mean())
-
-    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(hard.astype(np.uint8), connectivity=8)
-    components = max(0, num_labels - 1)
-    largest_area = int(stats[1:, cv2.CC_STAT_AREA].max()) if components else 0
-    largest_component_ratio = largest_area / area if area else 0.0
-
-    status, reason = "success", "ok"
-    if foreground_ratio < 0.015:
-        status, reason = "review", "almost everything became transparent"
-    elif foreground_ratio > 0.995:
-        status, reason = "review", "almost nothing was removed"
-    elif touches_border_ratio > 0.92:
-        status, reason = "review", "foreground touches most image borders"
-    elif components > 25 and largest_component_ratio < 0.15:
-        status, reason = "review", "mask is fragmented"
-
-    return MaskQuality(
-        transparent_ratio=round(transparent_ratio, 4),
-        foreground_ratio=round(foreground_ratio, 4),
-        touches_border_ratio=round(touches_border_ratio, 4),
-        components=components,
-        largest_component_ratio=round(largest_component_ratio, 4),
-        status=status,
-        reason=reason,
-    )
-
-
-def quality_score(q: MaskQuality) -> float:
-    """
-    Numeric score for comparing two MaskQuality results. Higher is better.
-
-    A "success" mask always outscores a "review" mask (10-point bonus).
-    Within the same status, scores reflect:
-      - foreground_ratio: ideally ~0.35; extremes (too empty/too full) are penalised
-      - touches_border_ratio: lower is better
-      - largest_component_ratio: higher means the product is one coherent blob
-    """
-    status_bonus = 10.0 if q.status == "success" else 0.0
-    fg = q.foreground_ratio
-    fg_score = 1.0 - min(1.0, abs(fg - 0.35) / 0.35)
-    border_score = 1.0 - q.touches_border_ratio
-    return status_bonus + fg_score + border_score + q.largest_component_ratio
+# Exact original QA gate — no reimplementation.
+from .originals import MaskQuality, assess_mask  # noqa: F401
 
 
 def save_cutout(

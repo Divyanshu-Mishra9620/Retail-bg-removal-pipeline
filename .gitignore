@@ -14,15 +14,14 @@ venv/
 .venv/
 env/
 
-# Model weights (large binary — store separately)
-# best.pt is committed directly (6.5 MB, within GitHub's limit)
+# Model weights 
 *.pth
 *.onnx
 # *.bin and *.safetensors are HuggingFace cache files, not committed
 *.bin
 *.safetensors
 
-# Pipeline outputs (generated files)
+# Pipeline outputs
 input_images/
 output_clean/
 output_review/
@@ -33,7 +32,7 @@ results_bi_yolo/
 input_img/
 curation_backup/
 
-# Manifests & logs (generated at runtime)
+# Manifests & logs
 *.jsonl
 *.log
 

@@ -1,19 +1,23 @@
 """
 Universal Retail Product Background Removal Pipeline
 =====================================================
-best.pt is a 1-class YOLOv8-seg model. A SINGLE inference per image yields both
-a semantic mask (fusion prior) and a crop box (BiRefNet hint). BiRefNet refines
-the edges inside the product region; the YOLO mask gates out false positives and
-fills low-contrast product BiRefNet drops ("semantic-gated matting").
+Production orchestrator around two PROVEN original scripts. It does NOT
+reimplement any image processing — every segmentation/refinement/QA/compose
+step is the exact original function (imported via universal_pipeline.originals).
 
-No image is rejected for a single detector's miss — every stage has a fallback.
+Per-image flow ("Script A -> Script B if needed"):
+  PRIMARY  : test_BiRefNet.py flow  (YOLO crop box -> BiRefNet -> refine -> QA)
+  FALLBACK : Retail_AI_Training/test.py flow (YOLO-seg -> mask -> smooth) when
+             the BiRefNet result fails QA.
+
+Models are loaded ONCE. Output is byte-equivalent to running the original
+script that produced each image (save is leak-proof, matching test.py).
 
 Usage
 -----
   python run_pipeline.py --input ./input_images --output ./output_clean
   python run_pipeline.py --input ./input_images --dry-run
   python run_pipeline.py --input ./input_images --allow-model-download   # first run
-  python run_pipeline.py --input ./input_images --no-fusion              # disable fusion
 """
 
 import argparse
@@ -33,7 +37,7 @@ from universal_pipeline.orchestrator import process_one_image
 
 def parse_args() -> SystemConfig:
     p = argparse.ArgumentParser(
-        description="Universal retail product background removal (YOLO-seg + BiRefNet).",
+        description="Universal retail background removal — orchestrates test_BiRefNet.py + test.py.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -41,33 +45,20 @@ def parse_args() -> SystemConfig:
     # ── I/O ──────────────────────────────────────────────────────────────────
     p.add_argument("--input", default="./input_images", help="Folder of input product images.")
     p.add_argument("--output", default="./output_clean", help="Folder for accepted PNG cutouts.")
-    p.add_argument("--review", default="./output_review", help="Folder for QA-flagged / fallback cutouts.")
-    p.add_argument("--manifest", default="./pipeline_manifest.jsonl", help="Path for JSONL run manifest.")
+    p.add_argument("--review", default="./output_review", help="Folder for QA-flagged cutouts.")
+    p.add_argument("--manifest", default="./pipeline_manifest.jsonl", help="JSONL run manifest.")
 
-    # ── YOLO-seg ──────────────────────────────────────────────────────────────
+    # ── Shared model weights ──────────────────────────────────────────────────
     p.add_argument("--yolo-model", default="./best.pt", help="Path to best.pt (YOLO-seg weights).")
-    p.add_argument("--yolo-conf", type=float, default=0.25, help="YOLO confidence threshold.")
-    p.add_argument("--yolo-iou", type=float, default=0.7, help="YOLO NMS IoU threshold.")
-    p.add_argument("--yolo-imgsz", type=int, default=640)
-    p.add_argument("--min-mask-area", type=int, default=500, help="Min pixels for a YOLO mask to count.")
-    p.add_argument("--yolo-pad", type=float, default=0.15, help="Fractional padding around crop box.")
 
-    # ── BiRefNet ──────────────────────────────────────────────────────────────
+    # ── BiRefNet flow (primary) — test_BiRefNet.py params ────────────────────
     p.add_argument("--model", default="ZhengPeng7/BiRefNet_dynamic", help="HuggingFace BiRefNet model ID.")
     p.add_argument("--size", type=int, default=1024, help="BiRefNet inference square size.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", choices=["cuda", "cpu"])
     p.add_argument("--no-fp16", action="store_true", help="Disable FP16 inference on CUDA.")
     p.add_argument("--allow-model-download", action="store_true", help="Allow HuggingFace download (first run).")
-
-    # ── Fusion ────────────────────────────────────────────────────────────────
-    p.add_argument("--fusion", action=argparse.BooleanOptionalAction, default=True,
-                   help="Enable semantic-gated matting (gate + fill). --no-fusion to disable.")
-    p.add_argument("--gate-dilate-frac", type=float, default=0.02)
-    p.add_argument("--fill-erode-frac", type=float, default=0.06)
-    p.add_argument("--fill-min-alpha", type=int, default=40)
-    p.add_argument("--fusion-feather", type=float, default=0.8)
-
-    # ── BiRefNet refinement (full chain — max quality) ───────────────────────
+    p.add_argument("--yolo-conf", type=float, default=0.15, help="YOLO conf for the BiRefNet crop box.")
+    p.add_argument("--yolo-pad", type=float, default=0.15, help="Fractional padding around crop box.")
     p.add_argument("--guided-filter", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--grabcut-refine", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--grabcut-iters", type=int, default=5)
@@ -76,7 +67,13 @@ def parse_args() -> SystemConfig:
     p.add_argument("--solidify", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--edge-trim", type=int, default=1)
     p.add_argument("--feather", type=float, default=0.8)
-    p.add_argument("--edge-blur", type=int, default=5, help="Smoothing for YOLO-mask fallback path.")
+
+    # ── YOLO-seg flow (fallback) — test.py params ────────────────────────────
+    p.add_argument("--seg-conf", type=float, default=0.25, help="YOLO-seg confidence (test.py).")
+    p.add_argument("--seg-iou", type=float, default=0.7, help="YOLO-seg NMS IoU (test.py).")
+    p.add_argument("--seg-imgsz", type=int, default=640)
+    p.add_argument("--min-mask-area", type=int, default=500, help="Min YOLO-seg mask pixels (test.py).")
+    p.add_argument("--edge-blur", type=int, default=5, help="smooth_alpha blur radius (test.py).")
 
     # ── Misc ──────────────────────────────────────────────────────────────────
     p.add_argument("--save-masks", action="store_true")
@@ -87,17 +84,16 @@ def parse_args() -> SystemConfig:
 
     return SystemConfig(
         input_dir=a.input, output_dir=a.output, review_dir=a.review, manifest_path=a.manifest,
-        yolo_weights=a.yolo_model, yolo_conf=a.yolo_conf, yolo_iou=a.yolo_iou,
-        yolo_imgsz=a.yolo_imgsz, yolo_min_mask_area=a.min_mask_area, yolo_pad=a.yolo_pad,
+        yolo_weights=a.yolo_model,
         birefnet_model=a.model, birefnet_size=a.size, device=a.device,
         use_fp16=not a.no_fp16, allow_model_download=a.allow_model_download,
-        enable_fusion=a.fusion, gate_dilate_frac=a.gate_dilate_frac,
-        fill_erode_frac=a.fill_erode_frac, fill_min_alpha=a.fill_min_alpha,
-        fusion_feather=a.fusion_feather,
+        yolo_conf=a.yolo_conf, yolo_pad=a.yolo_pad,
         guided_filter=a.guided_filter, grabcut_refine=a.grabcut_refine,
         grabcut_iters=a.grabcut_iters, hand_suppression=a.hand_suppression,
         component_mode=a.component_mode, solidify=a.solidify,
-        edge_trim=a.edge_trim, feather=a.feather, edge_blur=a.edge_blur,
+        edge_trim=a.edge_trim, feather=a.feather,
+        seg_conf=a.seg_conf, seg_iou=a.seg_iou, seg_imgsz=a.seg_imgsz,
+        seg_min_mask_area=a.min_mask_area, edge_blur=a.edge_blur,
         save_masks=a.save_masks, overwrite=a.overwrite, dry_run=a.dry_run,
     )
 
@@ -116,14 +112,13 @@ def main():
         sys.exit(1)
 
     print(f"\n{'='*64}")
-    print(f"  Universal Background Removal — YOLO-seg + BiRefNet")
+    print(f"  Universal Background Removal — orchestrating originals")
     print(f"{'='*64}")
     print(f"  Input        : {cfg.input_dir}  ({len(image_files)} images)")
     print(f"  Output       : {cfg.output_dir}")
     print(f"  Review       : {cfg.review_dir}")
-    print(f"  YOLO-seg     : {cfg.yolo_weights}  (conf={cfg.yolo_conf}, iou={cfg.yolo_iou})")
-    print(f"  BiRefNet     : {cfg.birefnet_model}  (size={cfg.birefnet_size})")
-    print(f"  Fusion       : {cfg.enable_fusion}   GrabCut: {cfg.grabcut_refine}")
+    print(f"  Primary      : test_BiRefNet.py flow  (yolo_conf={cfg.yolo_conf}, size={cfg.birefnet_size})")
+    print(f"  Fallback     : test.py YOLO-seg flow  (seg_conf={cfg.seg_conf}, iou={cfg.seg_iou})")
     print(f"  Device       : {cfg.device}  fp16={cfg.use_fp16 and cfg.device == 'cuda'}")
     print(f"  Dry-run      : {cfg.dry_run}")
     print(f"{'='*64}\n")
@@ -135,11 +130,12 @@ def main():
     # ── Load both models ONCE ─────────────────────────────────────────────────
     yolo_model = load_yolo(cfg.yolo_weights)
     if yolo_model is None:
-        print("[WARN] Running WITHOUT YOLO-seg — every image uses full-image BiRefNet.")
+        print("[WARN] No YOLO — BiRefNet runs full-image; no YOLO-seg fallback available.")
 
     try:
         birefnet_model = load_birefnet(
-            cfg.birefnet_model, cfg.device, use_fp16=cfg.use_fp16,
+            cfg.birefnet_model, cfg.device,
+            use_fp16=(cfg.use_fp16 and cfg.device == "cuda"),
             local_files_only=not cfg.allow_model_download,
         )
     except Exception as e:
@@ -151,9 +147,7 @@ def main():
 
     counts = {
         "skipped": 0, "success": 0, "review": 0, "error": 0,
-        # routing
-        "fused": 0, "birefnet_crop": 0, "fullimg_fallback": 0,
-        "yolo_mask_only": 0, "yolo_mask_alt": 0, "birefnet_alt": 0, "none": 0,
+        "birefnet_yolo_crop": 0, "birefnet_fullimage": 0, "yolo_seg_fallback": 0,
     }
 
     manifest_path = Path(cfg.manifest_path)
@@ -186,7 +180,7 @@ def main():
                 counts[routing] += 1
 
             if status == "review":
-                tqdm.write(f"  [REVIEW] {path.name} -> {result.get('reason', '')} ({routing})")
+                tqdm.write(f"  [REVIEW] {path.name} -> {result.get('reason', '')}")
 
             manifest.write(json.dumps(result, ensure_ascii=True) + "\n")
             manifest.flush()
@@ -199,11 +193,9 @@ def main():
     print(f"  Needs review           : {counts['review']}")
     print(f"  Errors                 : {counts['error']}")
     print(f"  ── Routing breakdown ──────────────────────────")
-    print(f"  Fused (YOLO+BiRefNet)  : {counts['fused']}")
-    print(f"  BiRefNet on crop       : {counts['birefnet_crop']}")
-    print(f"  Full-image fallback    : {counts['fullimg_fallback']}")
-    print(f"  YOLO mask (best/alt)   : {counts['yolo_mask_only'] + counts['yolo_mask_alt']}")
-    print(f"  BiRefNet alt (fallback): {counts['birefnet_alt']}")
+    print(f"  BiRefNet (YOLO crop)   : {counts['birefnet_yolo_crop']}")
+    print(f"  BiRefNet (full image)  : {counts['birefnet_fullimage']}")
+    print(f"  YOLO-seg fallback      : {counts['yolo_seg_fallback']}")
     print(f"  Manifest               : {cfg.manifest_path}")
     print(f"{'='*64}\n")
 
